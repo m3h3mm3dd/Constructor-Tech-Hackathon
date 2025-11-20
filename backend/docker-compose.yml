@@ -1,0 +1,22 @@
+version: "3.8"
+
+services:
+  db:
+    image: postgres:15
+    environment:
+      POSTGRES_USER: user
+      POSTGRES_PASSWORD: password
+      POSTGRES_DB: aibackend
+    ports:
+      - "5432:5432"
+
+  backend:
+    build: .
+    environment:
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-changeme}
+      DB_URL: postgresql+asyncpg://user:password@db:5432/aibackend
+      CORS_ORIGINS: "*"
+    ports:
+      - "8000:8000"
+    depends_on:
+      - db
