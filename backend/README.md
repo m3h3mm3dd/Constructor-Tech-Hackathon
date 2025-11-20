@@ -100,8 +100,6 @@ The backend exposes endpoints and models to support each stage:
 
 2. **Configure environment variables**
 
-   Copy `.env.example` to `.env` and fill in at least the following:
-
    - `OPENAI_API_KEY` – your OpenRouter API key (starts with `sk-or-`).
    - `CORS_ORIGINS` – JSON array of allowed frontend origins (e.g. `["http://localhost:3000"]`).
    - `DB_URL` – database connection string (defaults to SQLite file `test.db`).
