@@ -61,6 +61,16 @@ def create_app() -> FastAPI:
     async def health_check() -> dict[str, str]:
         return {"status": "ok"}
 
+    # Root endpoint - redirect to docs
+    @app.get("/")
+    async def root():
+        return {
+            "message": "AI Agent Backend API",
+            "docs": "/docs",
+            "health": "/health",
+            "note": "This is an API server. Use the frontend at http://localhost:5173 or visit /docs for API documentation."
+        }
+
     return app
 
 
