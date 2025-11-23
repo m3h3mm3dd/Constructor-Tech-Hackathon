@@ -1,18 +1,16 @@
 """
-Asynchronous wrapper around the OpenAI chat API.
+Asynchronous wrapper around an OpenAI-compatible chat API.
 
-This module encapsulates communication with the OpenAI-compatible chat
-completion API.  The backend uses OpenRouter as the model provider, so
-the OpenAI client is configured with ``base_url`` pointing at
-``https://openrouter.ai/api/v1``.  Two helper functions are provided to
-generate completions either in a single response or as a streamed
-generator.  These helpers run blocking SDK calls in a worker thread
-via ``asyncio.to_thread`` to avoid blocking the event loop.
+This module defaults to Groq's free Llama 3.1 models using the
+OpenAI-compatible endpoint at https://api.groq.com/openai/v1. Two helper
+functions are provided to generate completions either in a single response
+or as a streamed generator. These helpers run blocking SDK calls in a
+worker thread via ``asyncio.to_thread`` to avoid blocking the event loop.
 
-If you wish to change models or providers, modify the ``_client``
-configuration below and update default model names in the function
-signatures.  To use this client, ensure that ``OPENAI_API_KEY`` is
-defined in your ``.env`` file.
+If you wish to change models or providers, set ``LLM_API_KEY`` and
+``LLM_API_BASE`` in ``.env`` (or fallback to ``OPENAI_API_KEY`` for
+OpenRouter/OpenAI). Update ``settings.LLM_MODEL`` to point at the model
+you want to call.
 """
 
 from __future__ import annotations
@@ -21,23 +19,22 @@ import asyncio
 import logging
 from typing import Any, AsyncGenerator, Dict, Iterable, List, Optional
 
-from openai import OpenAI, RateLimitError, APIError, AuthenticationError
+from openai import OpenAI, RateLimitError, APIError, AuthenticationError, APIStatusError, OpenAIError
 
 from .config import settings
 
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
-# Client configuration
+# Client configuration (lazy)
 # ---------------------------------------------------------------------------
-# We use OpenRouter as the underlying provider for chat completions.  The
-# OpenAI SDK accepts a custom ``base_url`` which is forwarded to
-# OpenRouter.  All OpenRouter models are namespaced under a provider
-# prefix, e.g. ``openai/gpt-4o-mini`` or ``qwen/qwen2.5-7b-instruct:free``.
-_client = OpenAI(
-    api_key=settings.OPENAI_API_KEY,
-    base_url="https://openrouter.ai/api/v1",  # route all calls through OpenRouter
-)
+def _get_client() -> OpenAI:
+    api_key = settings.LLM_API_KEY or settings.OPENAI_API_KEY
+    if not api_key:
+        raise OpenAIError(
+            "Missing LLM_API_KEY (or OPENAI_API_KEY). Set it in backend/.env before running the app/worker."
+        )
+    return OpenAI(api_key=api_key, base_url=settings.LLM_API_BASE)
 
 
 async def generate(
@@ -45,6 +42,7 @@ async def generate(
     model: str | None = None,
     tools: Optional[Iterable[Dict[str, Any]]] = None,
     stream: bool = False,
+    max_tokens: int = 4000,  # Reduced from default to avoid credit issues
 ) -> str:
     """Generate a single chat completion.
 
@@ -53,10 +51,16 @@ async def generate(
         model: Model name to use. Defaults to a freely available OpenRouter model.
         tools: Currently ignored. Tools are not supported in OpenRouter free models.
         stream: When True, streaming will accumulate all chunks before return.
+        max_tokens: Maximum tokens to generate. Default 4000 to avoid credit issues.
 
     Returns:
         The full assistant reply text, or an error string if something goes wrong.
     """
+    try:
+        client = _get_client()
+    except OpenAIError as e:
+        return str(e)
+
     # Use the configured model if none is explicitly provided. This allows
     # callers to override the model on a per‑request basis while keeping
     # ``settings.LLM_MODEL`` as the sensible default.
@@ -65,11 +69,12 @@ async def generate(
         "model": selected_model,
         "messages": messages,
         "stream": stream,
+        "max_tokens": max_tokens,
     }
     # Tools are not passed through for now; free OpenRouter models do not
     # support function/tool calling.  If provided, silently ignore.
     def call_api() -> Any:
-        return _client.chat.completions.create(**params)
+        return client.chat.completions.create(**params)
 
     try:
         response = await asyncio.to_thread(call_api)
@@ -77,8 +82,18 @@ async def generate(
         logger.exception("OpenAI auth error (invalid API key): %s", e)
         return (
             "Error: Invalid API key. "
-            "Check OPENAI_API_KEY in the backend .env and make sure it’s correct."
+            "Check OPENAI_API_KEY in the backend .env and make sure it's correct."
         )
+    except APIStatusError as e:
+        if e.status_code == 402:
+            logger.exception("OpenAI insufficient credits: %s", e)
+            return (
+                "Error: Insufficient credits on OpenRouter. "
+                "Please add credits at https://openrouter.ai/settings/credits "
+                "or use a model with lower token requirements."
+            )
+        logger.exception("OpenAI API status error: %s", e)
+        return f"Error: API returned status {e.status_code}. Please try again later."
     except RateLimitError as e:
         logger.exception("OpenAI rate limit / insufficient quota: %s", e)
         return (
@@ -114,6 +129,7 @@ async def generate_stream(
     messages: List[Dict[str, Any]],
     model: str | None = None,
     tools: Optional[Iterable[Dict[str, Any]]] = None,
+    max_tokens: int = 4000,  # Reduced from default
 ) -> AsyncGenerator[str, None]:
     """Generate a streaming chat completion.
 
@@ -121,15 +137,22 @@ async def generate_stream(
     error occurs, a single descriptive string is yielded and the generator
     terminates.
     """
+    try:
+        client = _get_client()
+    except OpenAIError as e:
+        yield str(e)
+        return
+
     selected_model = model or settings.LLM_MODEL
     params: Dict[str, Any] = {
         "model": selected_model,
         "messages": messages,
         "stream": True,
+        "max_tokens": max_tokens,
     }
 
     def call_api() -> Any:
-        return _client.chat.completions.create(**params)
+        return client.chat.completions.create(**params)
 
     try:
         response = await asyncio.to_thread(call_api)
@@ -137,8 +160,19 @@ async def generate_stream(
         logger.exception("OpenAI auth error (stream): %s", e)
         yield (
             "Error: Invalid API key. "
-            "Check OPENAI_API_KEY in the backend .env and make sure it’s correct."
+            "Check OPENAI_API_KEY in the backend .env and make sure it's correct."
         )
+        return
+    except APIStatusError as e:
+        if e.status_code == 402:
+            logger.exception("OpenAI insufficient credits (stream): %s", e)
+            yield (
+                "Error: Insufficient credits on OpenRouter. "
+                "Please add credits at https://openrouter.ai/settings/credits."
+            )
+            return
+        logger.exception("OpenAI API status error (stream): %s", e)
+        yield f"Error: API returned status {e.status_code}. Please try again later."
         return
     except RateLimitError as e:
         logger.exception("OpenAI rate limit / insufficient quota (stream): %s", e)

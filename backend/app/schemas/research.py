@@ -39,13 +39,17 @@ class ResearchJobCompanyStatus(BaseModel):
 class ResearchJobResponse(BaseModel):
     """Response returned when querying a research job."""
 
-    job_id: int = Field(..., alias="id")
+    job_id: int = Field(..., description="Unique identifier for the research job")
     segment: str
     status: str
     error_message: Optional[str] = None
     created_at: datetime
     finished_at: Optional[datetime] = None
     companies: List[ResearchJobCompanyStatus] = []
+    
+    class Config:
+        # Allow population by field name to support both 'id' and 'job_id'
+        populate_by_name = True
 
 
 class CompanySummary(BaseModel):
@@ -57,6 +61,7 @@ class CompanySummary(BaseModel):
     region: Optional[str] = None
     size_bucket: Optional[str] = None
     description: Optional[str] = None
+    segment: Optional[str] = None  # Added segment field
     last_updated: Optional[datetime] = None
     has_ai_features: Optional[bool] = None
 
@@ -106,8 +111,12 @@ class CompanyCompareRequest(BaseModel):
 class CompanyComparison(BaseModel):
     """Differentiation for a single company returned in a comparison."""
 
-    company_id: int
+    company_id: int = Field(..., alias="companyId")
     points: List[str] = []
+    
+    class Config:
+        populate_by_name = True
+        allow_population_by_field_name = True
 
 
 class CompanyCompareResponse(BaseModel):

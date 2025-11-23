@@ -19,21 +19,21 @@ AGENTS: Dict[str, AgentConfig] = {
         name="base",
         description="Base agent with a generic system prompt",
         prompt_file="base_system.txt",
-        model="qwen/qwen2.5-7b-instruct:free",
+        model="llama-3.1-8b-instant",
         tools=[],
     ),
     "student": AgentConfig(
         name="student",
         description="Friendly study companion tailored for students",
         prompt_file="student_agent.txt",
-        model="qwen/qwen2.5-7b-instruct:free",
+        model="llama-3.1-8b-instant",
         tools=[],
     ),
     "prof": AgentConfig(
         name="prof",
         description="Experienced professor with deep academic knowledge",
         prompt_file="prof_agent.txt",
-        model="qwen/qwen2.5-7b-instruct:free",
+        model="llama-3.1-8b-instant",
         tools=[],
     ),
     # New agent for structured EdTech competitor research. This persona
@@ -44,7 +44,7 @@ AGENTS: Dict[str, AgentConfig] = {
         name="market",
         description="Market research agent for EdTech and LMS competitor intelligence",
         prompt_file="market_agent.txt",
-        model="qwen/qwen2.5-7b-instruct:free",
+        model="llama-3.1-8b-instant",
         tools=[],
     ),
 }

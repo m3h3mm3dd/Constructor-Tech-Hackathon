@@ -25,14 +25,12 @@ export interface ResearchJobCompanyStatus {
 
 export interface ResearchJob {
   /**
-   * Unique identifier for the research job. Mirrors the ``id`` field in the
-   * backend response. Note that the Python model uses ``job_id`` as the
-   * internal attribute name but serialises it with the alias ``id``.
+   * Unique identifier for the research job. Backend returns this as 'job_id'
    */
-  id: number;
+  job_id: number;
   /** Market segment that was used to start the research job. */
   segment: string;
-  /** Current status of the job: 'pending', 'running', 'completed' or 'failed'. */
+  /** Current status of the job: 'pending', 'running', 'done' or 'failed'. */
   status: string;
   /** Optional error message if the job failed. */
   error_message?: string | null;
@@ -54,6 +52,7 @@ export interface CompanySummary {
   name: string;
   category?: string | null;
   region?: string | null;
+  segment?: string | null;
   size_bucket?: string | null;
   description?: string | null;
   last_updated?: string | null;
@@ -62,7 +61,6 @@ export interface CompanySummary {
 
 export interface CompanyProfile extends CompanySummary {
   website?: string | null;
-  segment?: string | null;
   background?: string | null;
   products?: string | null;
   target_segments?: string | null;
@@ -70,10 +68,17 @@ export interface CompanyProfile extends CompanySummary {
   market_position?: string | null;
   strengths?: string | null;
   risks?: string | null;
-  has_ai_features?: boolean | null;
   compliance_tags?: string | null;
   first_discovered?: string | null;
-  sources?: { id: number; url: string; title?: string | null; snippet?: string | null; source_type?: string | null; relevance_score?: number | null; published_at?: string | null }[];
+  sources?: { 
+    id: number; 
+    url: string; 
+    title?: string | null; 
+    snippet?: string | null; 
+    source_type?: string | null; 
+    relevance_score?: number | null; 
+    published_at?: string | null 
+  }[];
 }
 
 
@@ -98,7 +103,7 @@ export interface CompareRequest {
  * positioning).
  */
 export interface CompareCompanyDifferences {
-  companyId: number;
+  company_id: number;
   points: string[];
 }
 
@@ -114,6 +119,99 @@ export interface CompareResponse {
   common_strengths: string[];
   key_differences: CompareCompanyDifferences[];
   opportunity_gaps: string[];
+}
+
+// Session-oriented types
+export interface SessionListItem {
+  id: string;
+  label: string;
+  status: string;
+  updated_at: string;
+}
+
+export interface SessionLog {
+  id: number;
+  ts: string;
+  level: string;
+  message: string;
+  meta?: Record<string, unknown>;
+}
+
+export interface ChartsPayload {
+  segmentation?: { label: string; value: number }[];
+  company_scale?: { name: string; employees: number }[];
+  performance_matrix?: { x: number; score: number }[];
+  market_evolution?: { name: string; year: number; score: number; size: number }[];
+}
+
+export interface SessionCompanyCard {
+  id: string;
+  name: string;
+  domain?: string | null;
+  score?: number | null;
+  status: string;
+  data_reliability?: string | null;
+  last_verified_at?: string | null;
+  founded_year?: number | null;
+  employees?: number | null;
+  hq_city?: string | null;
+  hq_country?: string | null;
+  primary_tags?: string[] | null;
+  summary?: string | null;
+}
+
+export interface SessionResponse {
+  id: string;
+  label: string;
+  segment?: string | null;
+  status: string;
+  max_companies?: number | null;
+  companies_found: number;
+  charts?: ChartsPayload | null;
+  scoring_config?: Record<string, unknown> | null;
+  created_at: string;
+  updated_at: string;
+  companies: SessionCompanyCard[];
+}
+
+export interface TrendBar {
+  label: string;
+  impact: number;
+}
+
+export interface TrendResponse {
+  overview: string;
+  bars: TrendBar[];
+}
+
+export interface CompanySourceItem {
+  url: string;
+  label?: string | null;
+  source_type?: string | null;
+}
+
+export interface SessionCompanyProfile {
+  id: string;
+  name: string;
+  domain?: string | null;
+  score?: number | null;
+  status: string;
+  data_reliability?: string | null;
+  last_verified_at?: string | null;
+  founded_year?: number | null;
+  employees?: number | null;
+  hq_city?: string | null;
+  hq_country?: string | null;
+  primary_tags?: string[] | null;
+  summary?: string | null;
+  score_analysis?: string | null;
+  market_position?: string | null;
+  background?: string | null;
+  recent_developments?: string | null;
+  products_services?: string | null;
+  scale_reach?: string | null;
+  strategic_notes?: string | null;
+  sources: CompanySourceItem[];
 }
 
 export interface ChatMessage {
