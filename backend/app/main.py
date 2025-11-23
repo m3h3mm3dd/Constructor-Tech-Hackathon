@@ -19,9 +19,7 @@ from .api.v1 import (
     stream_routes,
     agent_routes,
     admin_routes,
-    rag_routes,
-    assistant_routes,
-    course_routes,
+    research_routes,
 )
 
 
@@ -53,12 +51,8 @@ def create_app() -> FastAPI:
     app.include_router(stream_routes.router, prefix="/api/v1/chat/stream", tags=["stream"])
     app.include_router(agent_routes.router, prefix="/api/v1/agents", tags=["agents"])
     app.include_router(admin_routes.router, prefix="/api/v1/admin", tags=["admin"])
-    # RAG endpoints for document ingestion and retrieval
-    app.include_router(rag_routes.router, prefix="/api/v1/rag", tags=["rag"])
-    # Assistant endpoints (study planning, FAQ summarisation, quiz generation)
-    app.include_router(assistant_routes.router, prefix="/api/v1/assistant", tags=["assistant"])
-    # Course and task management endpoints
-    app.include_router(course_routes.router, prefix="/api/v1", tags=["courses"])
+    # Include the competitor research endpoints under /api/v1/research
+    app.include_router(research_routes.router, prefix="/api/v1", tags=["research"])
 
     # Health check endpoint. Useful for Kubernetes probes or uptime monitoring.
     @app.get("/health")

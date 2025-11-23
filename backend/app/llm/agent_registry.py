@@ -14,33 +14,37 @@ from ..schemas.agent import AgentConfig
 
 # Define available agents. When adding a new agent, ensure the prompt file
 # exists in ``app/llm/prompts`` and list any tools the agent may use.
-# Register the available agents.  Each agent has a name, description,
-# associated system prompt file, model identifier and allowed tools.  The
-# default model is ``openai/gpt-oss-20b:free`` which is hosted by
-# OpenRouter.  Tools are disabled by default because the free model
-# does not support function calling; when using a paid model you can
-# populate the ``tools`` list with names corresponding to functions in
-# ``app/llm/tools``.
 AGENTS: Dict[str, AgentConfig] = {
     "base": AgentConfig(
         name="base",
         description="Base agent with a generic system prompt",
         prompt_file="base_system.txt",
-        model="openai/gpt-4o-mini",
+        model="qwen/qwen2.5-7b-instruct:free",
         tools=[],
     ),
     "student": AgentConfig(
         name="student",
         description="Friendly study companion tailored for students",
         prompt_file="student_agent.txt",
-        model="openai/gpt-4o-mini",
+        model="qwen/qwen2.5-7b-instruct:free",
         tools=[],
     ),
     "prof": AgentConfig(
         name="prof",
         description="Experienced professor with deep academic knowledge",
         prompt_file="prof_agent.txt",
-        model="openai/gpt-4o-mini",
+        model="qwen/qwen2.5-7b-instruct:free",
+        tools=[],
+    ),
+    # New agent for structured EdTech competitor research. This persona
+    # specialises in discovering and profiling companies in the education
+    # technology sector. It uses a dedicated system prompt (see
+    # app/llm/prompts/market_agent.txt) and the same free OpenRouter model.
+    "market": AgentConfig(
+        name="market",
+        description="Market research agent for EdTech and LMS competitor intelligence",
+        prompt_file="market_agent.txt",
+        model="qwen/qwen2.5-7b-instruct:free",
         tools=[],
     ),
 }

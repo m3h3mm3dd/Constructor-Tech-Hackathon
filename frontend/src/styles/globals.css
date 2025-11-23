@@ -1,0 +1,9 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* Additional global styles */
+body {
+  /* Set a light, neutral background and dark neutral text */
+  @apply bg-[#fafafa] text-neutral-900;
+}
