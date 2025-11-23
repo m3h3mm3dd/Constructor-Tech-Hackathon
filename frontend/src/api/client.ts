@@ -8,7 +8,7 @@ import axios from 'axios';
 function getBaseUrl(): string {
   const stored = localStorage.getItem('apiBaseUrl');
   const env = import.meta.env.VITE_API_BASE_URL || '';
-  return stored ?? env;
+  return stored || env || 'http://localhost:8000';
 }
 
 /**
