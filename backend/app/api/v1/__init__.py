@@ -10,6 +10,4 @@ from . import chat_routes  # noqa: F401
 from . import stream_routes  # noqa: F401
 from . import agent_routes  # noqa: F401
 from . import admin_routes  # noqa: F401
-from . import rag_routes  # noqa: F401
-from . import assistant_routes  # noqa: F401
-from . import course_routes  # noqa: F401
+from . import research_routes  # noqa: F401
