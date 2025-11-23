@@ -262,12 +262,11 @@ class CompanyProfile(Base):
     market_position = Column(Text, nullable=True)
     background = Column(Text, nullable=True)
     recent_developments = Column(Text, nullable=True)
-    products_services = Column(Text, nullable=True)
+    products_services = Column(Text, nullable=True)  # Store as JSON string
     scale_reach = Column(Text, nullable=True)
     strategic_notes = Column(Text, nullable=True)
 
     company = relationship("SessionCompany", back_populates="profile")
-
 
 class CompanySource(Base):
     """Sources underpinning a company profile."""

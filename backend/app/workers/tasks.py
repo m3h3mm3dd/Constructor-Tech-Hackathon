@@ -1,312 +1,444 @@
 """
-Background tasks for the AI agent backend.
-
-This module defines both scheduled jobs (via APScheduler) and Celery tasks for
-long-running operations. Celery tasks are used when the workload is heavy and
-should be executed asynchronously in a worker process, while the scheduler is
-used for periodic maintenance jobs such as cleanup or analytics aggregation.
+Celery tasks for background job processing.
 """
 
-from __future__ import annotations
-
-from datetime import datetime
-from typing import Optional
-import logging
-
-try:
-    from celery import shared_task  # type: ignore[import-not-found]
-except Exception:  # pragma: no cover
-    # Provide a dummy decorator when Celery isn't installed. The dummy decorator
-    # simply returns the function unchanged so that tests can run without Celery.
-    def shared_task(*args, **kwargs):  # type: ignore
-        def wrapper(func):
-            return func
-        return wrapper
-
-from .scheduler import scheduler
-from ..core.celery_app import celery_app
-from ..services.session_service import append_log, build_default_charts
-from ..db.models import ResearchSession, SessionCompany, CompanyProfile, CompanySource
-from sqlalchemy import select
-from sqlalchemy.ext.asyncio import AsyncSession
-from ..db.session import async_session as async_session_factory
-from ..core.openai_client import generate
-from ..core.search import search_web, SearchError
-import random
 import asyncio
+import json
+import logging
+import re
+from datetime import datetime
+from html import unescape
+from typing import Any, Dict, List, Optional
+
+import httpx
+from celery import shared_task
+from sqlalchemy import select, update
+from sqlalchemy.ext.asyncio import AsyncSession
+
 from ..core.config import settings
+from ..core.llm import LLMService
+from ..core.search import SearchService
+from ..db.models import (
+    CompanyProfile,
+    CompanySource,
+    ResearchSession,
+    ResearchSessionLog,
+    SessionCompany,
+)
+from ..db.session import async_session
 
 logger = logging.getLogger(__name__)
 
 
-def register_tasks() -> None:
-    """Register recurring tasks with the scheduler.
-
-    At application startup, call this function to register any periodic
-    maintenance tasks. For example, you might schedule regular cleanup of
-    outdated chat sessions or aggregate usage analytics.
-    """
-    # Example: schedule a dummy task every hour
-    scheduler.add_job(dummy_task, "interval", hours=1)
+@shared_task(bind=True, name="backend.app.workers.tasks.run_agent_task")
+def run_agent_task(self, query: str, chat_id: str) -> Dict[str, Any]:
+    """Run agent research task."""
+    logger.info(f"Running agent task for chat {chat_id}")
+    return {"status": "completed", "query": query}
 
 
-async def dummy_task() -> None:
-    """A simple scheduled job that logs the current time."""
-    print(f"Dummy task executed at {datetime.utcnow()}")
+@shared_task(bind=True, name="backend.app.workers.tasks.run_scout_session")
+def run_scout_session(self, session_id: str) -> Dict[str, Any]:
+    """Run full scout research session."""
+    logger.info(f"Celery worker: starting scout session {session_id}")
+    
+    try:
+        # Run async work
+        asyncio.run(_run_session_async(session_id))
+        return {"status": "completed", "session_id": session_id}
+    except Exception as e:
+        logger.exception(f"Scout session {session_id} failed: {e}")
+        # Update session status to failed
+        asyncio.run(_mark_session_failed(session_id, str(e)))
+        raise
 
 
-@celery_app.task(bind=True, name="backend.app.workers.tasks.run_agent_task")
-def run_agent_task(self, conversation: list[dict[str, str]]) -> str:
-    """Celery task that runs a long AI agent workflow.
-
-    Args:
-        conversation (list[dict[str, str]]): The chat history/messages as a list
-            of dictionaries with ``role`` and ``content`` keys.
-
-    Returns:
-        str: Final response from the AI agent.
-
-    Notes:
-        This is a simplified example. In a real system, this task might
-        orchestrate multiple tool calls, retrieval steps, or other
-        computation-intensive operations. Progress updates can be emitted
-        via ``self.update_state`` to provide intermediate statuses to the
-        streaming API.
-    """
-    # Import inside the task to avoid circular dependencies
-    from ..services.chat_service import handle_chat
-    from ..schemas.common import Message
-    import asyncio
-
-    async def generate_response() -> str:
-        # Convert dicts back into Pydantic models if necessary; here we assume
-        # they already match the expected format.
-        return await handle_chat([Message(**m) for m in conversation])  # type: ignore[name-defined]
-
-    # Run the asynchronous chat handler in a synchronous Celery context
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
-    response = loop.run_until_complete(generate_response())
-    loop.close()
-    return response
+async def run_session_inline(session_id: str):
+    """Run session inline (for testing without Celery)."""
+    try:
+        await _run_session_async(session_id)
+    except Exception as e:
+        logger.exception(f"Inline session {session_id} failed: {e}")
+        await _mark_session_failed(session_id, str(e))
+        raise
 
 
-@celery_app.task(bind=True, name="backend.app.workers.tasks.run_scout_session")
-def run_scout_session(self, session_id: str) -> str:
-    """Celery task to execute the scout pipeline for a session."""
-    logger.info("Celery worker: starting scout session %s", session_id)
-    asyncio.run(_run_session_async(session_id))
-    return "ok"
-
-# Exported helper to run inline (FastAPI fallback when Celery/Redis not running)
-async def run_session_inline(session_id: str) -> None:
-    logger.info("Inline scout run for session %s", session_id)
-    await _run_session_async(session_id)
-
-
-async def _run_session_async(session_id: str) -> None:
-    async with async_session_factory() as db:  # type: AsyncSession
+async def _run_session_async(session_id: str):
+    """Core async logic for running a scout session."""
+    async with async_session() as db:
+        # Get session
         result = await db.execute(select(ResearchSession).where(ResearchSession.id == session_id))
-        session = result.scalars().first()
+        session = result.scalar_one_or_none()
+        
         if not session:
-            return
+            raise ValueError(f"Session {session_id} not found")
+        
+        # Update to RUNNING
         session.status = "RUNNING"
         await db.commit()
-        await append_log(db, session_id, "info", "Scanning for key players...")
-        await append_log(db, session_id, "info", "Generating smart search queries...")
-        await append_log(db, session_id, "info", "Crawling landing pages and docs...")
-
-        # Discovery via LLM + search (fallback to simple heuristic)
-        companies = await _discover_companies(session.label)
-        if companies:
-            await append_log(db, session_id, "success", f"Discovered {len(companies)} candidates.")
-        else:
-            await append_log(db, session_id, "warning", "No candidates discovered; using fallback.")
-
-        discovered: list[SessionCompany] = []
-        for comp in companies[: session.max_companies or 3]:
-            # basic enrichment defaults
-            employees_guess = comp.get("employees") or random.randint(500, 5000)
-            founded_guess = comp.get("founded_year") or random.randint(1995, 2022)
-            tags = comp.get("tags") or [segment or "", "education"]
-            c = SessionCompany(
-                session_id=session_id,
-                name=comp.get("name"),
-                domain=comp.get("domain"),
-                primary_tags=tags,
-                status="PENDING",
-                score=comp.get("score") or random.randint(70, 95),
-                data_reliability="medium",
-                employees=employees_guess,
-                founded_year=founded_guess,
-            )
-            db.add(c)
-            await db.commit()
-            await db.refresh(c)
-            discovered.append(c)
-
-        await append_log(db, session_id, "success", f"Found candidates: {', '.join([c.name for c in discovered])}")
-        session.companies_found = len(discovered)
-        await db.commit()
-
-        # Profile each
-        for comp in discovered:
-            await append_log(db, session_id, "info", f"Analyzing {comp.name}...")
-            profile_data = await _profile_company(comp.name, session.segment, comp.domain)
-            summary = profile_data.get("summary") or comp.summary
-            comp.summary = summary
-            comp.status = "COMPLETE"
-            comp.last_verified_at = comp.updated_at = comp.created_at
-            profile = CompanyProfile(
-                company_id=comp.id,
-                summary=summary,
-                score_analysis=profile_data.get("score_analysis") or "Generated by scout",
-                background=profile_data.get("background"),
-                products_services=profile_data.get("products_services"),
-                market_position=profile_data.get("market_position"),
-            )
-            await db.merge(profile)
-            sources = profile_data.get("sources") or []
-            for src in sources:
-                url = src.get("url") or src.get("link")
-                if not url:
-                    continue
-                db.add(
-                    CompanySource(
-                        company_id=comp.id,
-                        url=url,
-                        label=src.get("label") or src.get("title"),
-                        source_type=src.get("type") or "web",
-                    )
-                )
-            await db.commit()
-            await append_log(db, session_id, "success", f"Profile built: {comp.name}")
-
-        # Charts
-        charts = build_default_charts(discovered)
-        session.charts = charts
-        session.status = "COMPLETED"
-        session.updated_at = datetime.utcnow()
-        await db.commit()
-        await append_log(db, session_id, "success", "Mission Complete.")
-
-
-async def _discover_companies(segment: str) -> list[dict]:
-    # Try web search for context
-    search_context = ""
-    try:
-        queries = [f"{segment} company list", f"{segment} top companies"]
-        results = []
-        for q in queries:
-            try:
-                results += await search_web(q, num_results=4)
-            except SearchError:
-                continue
-        seen = set()
-        lines = []
-        for r in results[:8]:
-            url = r.get("url")
-            if not url or url in seen:
-                continue
-            seen.add(url)
-            lines.append(f"{r.get('title','')} | {url} | {r.get('snippet','')}")
-        search_context = "\n".join(lines)
-    except Exception:
-        search_context = ""
-
-    prompt = (
-        "CRITICAL RELIABILITY RULES:\n"
-        "- Only return real companies with active websites relevant to the topic.\n"
-        "- Do NOT hallucinate names; skip anything uncertain.\n"
-        "- Output JSON with key 'companies' as a list of objects: {name, website, tags}.\n"
-        f"Topic: {segment}\n"
-        "Search context:\n"
-        f"{search_context}\n"
-        "Return only JSON."
-    )
-    try:
-        raw = await generate(
-            [
-                {"role": "system", "content": "You are a market research assistant. Respond with JSON only."},
-                {"role": "user", "content": prompt},
-            ],
-            model=settings.LLM_MODEL,
-            max_tokens=800,
-        )
-        import json
-        data = json.loads(raw)
-        if isinstance(data, dict) and "companies" in data:
-            return data["companies"]
-        if isinstance(data, list):
-            return data
-    except Exception:
-        pass
-    # deterministic fallback
-    fallback = [
-        {"name": f"{segment.title()} Group", "domain": None, "tags": [segment, "education"]},
-        {"name": f"{segment.title()} Labs", "domain": None, "tags": [segment, "innovation"]},
-        {"name": f"{segment.title()} Systems", "domain": None, "tags": [segment, "platform"]},
-    ]
-    return fallback
-
-
-async def _fetch_context_for_company(name: str, segment: str | None) -> tuple[str, list[dict]]:
-    ctx_chunks = []
-    sources: list[dict] = []
-    queries = [f"{name} {segment or ''} company", f"{name} products", f"{name} background"]
-    seen_urls = set()
-    for q in queries:
+        
+        # Initialize services
+        search_service = SearchService(api_key=settings.SEARCH_API_KEY)
+        llm_service = LLMService(api_key=settings.LLM_API_KEY, model=settings.LLM_MODEL)
+        
         try:
-            results = await search_web(q, num_results=3)
-            for r in results:
-                url = r.get("url")
-                if not url or url in seen_urls:
+            # Step 1: Discover companies
+            await _add_log(db, session_id, "Starting company discovery...")
+            companies = await _discover_companies_reliably(
+                segment=session.segment,
+                max_companies=session.max_companies or 5,
+                search_service=search_service,
+                llm_service=llm_service
+            )
+            
+            await _add_log(db, session_id, f"Discovered {len(companies)} companies: {[c['name'] for c in companies]}")
+            
+            # Step 2: Save discovered companies
+            session.companies_found = len(companies)
+            for comp_data in companies:
+                comp = SessionCompany(
+                    session_id=session_id,
+                    name=comp_data.get("name", "Unknown"),
+                    domain=comp_data.get("domain", ""),
+                    primary_tags=comp_data.get("tags", []),
+                )
+                db.add(comp)
+            
+            await db.commit()
+            
+            # Step 3: Deep profile each company
+            result = await db.execute(
+                select(SessionCompany).where(SessionCompany.session_id == session_id)
+            )
+            companies_to_profile = result.scalars().all()
+            
+            for comp in companies_to_profile:
+                try:
+                    await _add_log(db, session_id, f"Deep research on {comp.name}...")
+                    
+                    profile_data = await _deep_profile_company(
+                        company_name=comp.name,
+                        company_domain=comp.domain,
+                        segment=session.segment,
+                        search_service=search_service,
+                        llm_service=llm_service
+                    )
+                    
+                    # Persist the detailed profile content
+                    profile = CompanyProfile(
+                        company_id=comp.id,
+                        summary=_safe_text(profile_data.get("summary")),
+                        score_analysis=_safe_text(profile_data.get("score_analysis")),
+                        market_position=_safe_text(profile_data.get("market_position")),
+                        background=_safe_text(profile_data.get("background")),
+                        recent_developments=_safe_text(profile_data.get("recent_developments")),
+                        products_services=_safe_text(profile_data.get("products_services")),
+                        scale_reach=_safe_text(profile_data.get("scale_reach")),
+                        strategic_notes=_safe_text(profile_data.get("strategic_notes")),
+                    )
+                    db.add(profile)
+
+                    # Update high-level company fields stored on SessionCompany
+                    comp.summary = profile.summary
+                    comp.data_reliability = profile_data.get("data_reliability", "medium")
+                    comp.last_verified_at = datetime.utcnow()
+                    comp.status = "COMPLETE"
+                    
+                    # Add sources
+                    for src in profile_data.get("sources", [])[:10]:  # Limit to 10 sources
+                        source = CompanySource(
+                            company_id=comp.id,
+                            url=src.get("url", ""),
+                            label=src.get("title", "Unknown"),
+                            source_type=src.get("source_type") or None,
+                        )
+                        db.add(source)
+                    
+                    await db.commit()
+                    await db.refresh(comp)
+                    
+                    await _add_log(db, session_id, f"✓ Profile complete: {comp.name}")
+                    
+                except Exception as e:
+                    await db.rollback()  # Critical: rollback on error
+                    logger.exception(f"Failed to profile {comp.name}: {e}")
+                    await _add_log(db, session_id, f"✗ Failed to profile {comp.name}: {str(e)[:100]}")
                     continue
-                seen_urls.add(url)
-                sources.append({"url": url, "title": r.get("title"), "snippet": r.get("snippet")})
-                ctx_chunks.append(f"{r.get('title','')} | {url} | {r.get('snippet','')}")
-        except Exception:
-            continue
-    context = "\n".join(ctx_chunks)
-    return context, sources
+            
+            # Step 4: Generate charts (placeholder)
+            charts_data = {
+                "segmentation": [],
+                "scale": [],
+                "performance": [],
+                "evolution": []
+            }
+            session.charts = charts_data  # store as dict (JSON column)
+            
+            # Mark complete
+            session.status = "COMPLETE"
+            session.updated_at = datetime.utcnow()
+            await db.commit()
+            
+            await _add_log(db, session_id, "✅ Research session complete!")
+            
+        except Exception as e:
+            await db.rollback()
+            logger.exception(f"Session {session_id} failed: {e}")
+            session.status = "FAILED"
+            await db.commit()
+            await _add_log(db, session_id, f"❌ Session failed: {str(e)}")
+            raise
 
 
-async def _profile_company(name: str, segment: str | None, domain: str | None) -> dict:
-    context, discovered_sources = await _fetch_context_for_company(name, segment)
-    prompt = (
-        "VERIFICATION PROTOCOL:\n"
-        "- Cross-check facts with at least two distinct sources.\n"
-        "- Only include information if sources agree or are corroborated.\n"
-        "- If unsure, set fields to null.\n"
-        "Return JSON with keys: summary, background, products_services, market_position, score_analysis, sources (list of {url,label,type}).\n"
-        f"Company: {name}\n"
-        f"Website: {domain or 'unknown'}\n"
-        f"Topic: {segment or 'general'}\n"
-        f"Sources:\n{context}\n"
-        "Return only JSON."
-    )
+async def _discover_companies_reliably(
+    segment: str,
+    max_companies: int,
+    search_service: SearchService,
+    llm_service: LLMService
+) -> List[Dict[str, Any]]:
+    """
+    Discover companies using multi-query search + LLM validation.
+    """
+    # Multiple search queries
+    queries = [
+        f"{segment} companies list",
+        f"top {segment} companies",
+        f"{segment} market leaders",
+        f"leading {segment} businesses"
+    ]
+    
+    all_results = []
+    for query in queries[:3]:  # Limit to 3 queries
+        try:
+            results = await search_service.search(query, num_results=10)
+            all_results.extend(results)
+            await asyncio.sleep(0.5)  # Rate limiting
+        except Exception as e:
+            logger.warning(f"Search failed for '{query}': {e}")
+    
+    # Build context
+    context = "\n\n".join([
+        f"Title: {r.get('title', '')}\nURL: {r.get('url', '')}\nContent: {r.get('content', '')[:300]}"
+        for r in all_results[:15]
+    ])
+    
+    # LLM extraction with strict instructions
+    prompt = f"""Based ONLY on the search results below, extract a list of {max_companies} real companies in the "{segment}" segment.
+
+CRITICAL RULES:
+1. Only return companies that appear in the search results OR that you are 100% certain exist
+2. Each company MUST have: name, domain (website URL), description
+3. Do NOT invent or hallucinate companies
+4. Return valid JSON array only
+
+Search Results:
+{context}
+
+Return format:
+[
+  {{"name": "Company Name", "domain": "company.com", "description": "Brief description", "tags": ["tag1", "tag2"]}},
+  ...
+]
+
+Return ONLY the JSON array, no markdown, no explanation."""
+    
     try:
-        raw = await generate(
-            [
-                {"role": "system", "content": "You are a careful analyst that outputs strict JSON only."},
-                {"role": "user", "content": prompt},
-            ],
-            model=settings.LLM_MODEL,
-            max_tokens=800,
-        )
-        import json
-        data = json.loads(raw)
-        if not isinstance(data, dict):
-            raise ValueError("Invalid profile JSON")
-        if "sources" not in data and discovered_sources:
-            data["sources"] = discovered_sources
-        return data
-    except Exception:
+        response = await llm_service.generate(prompt, max_tokens=2000)
+        
+        # Clean response
+        response_text = response.strip()
+        response_text = re.sub(r'```json\s*', '', response_text)
+        response_text = re.sub(r'```\s*$', '', response_text)
+        response_text = response_text.strip()
+        
+        companies = json.loads(response_text)
+        
+        # Validate
+        valid_companies = []
+        for c in companies:
+            if isinstance(c, dict) and "name" in c and "domain" in c:
+                valid_companies.append(c)
+        
+        return valid_companies[:max_companies]
+        
+    except Exception as e:
+        logger.error(f"LLM discovery failed: {e}")
+        return []
+
+
+async def _deep_profile_company(
+    company_name: str,
+    company_domain: str,
+    segment: str,
+    search_service: SearchService,
+    llm_service: LLMService
+) -> Dict[str, Any]:
+    """
+    Deep profile a single company with multi-source verification.
+    Returns data with proper types for JSON serialization.
+    """
+    # Multi-angle searches
+    search_queries = [
+        f"{company_name} company profile",
+        f"{company_name} products services",
+        f"{company_name} background information"
+    ]
+    
+    all_sources = []
+    for query in search_queries:
+        try:
+            results = await search_service.search(query, num_results=5)
+            all_sources.extend(results)
+            await asyncio.sleep(0.3)
+        except Exception as e:
+            logger.warning(f"Search failed for {company_name}: {e}")
+    
+    # Fetch website content
+    website_content = ""
+    if company_domain:
+        try:
+            website_content = await _fetch_website_content(company_domain)
+        except Exception as e:
+            logger.warning(f"Failed to fetch website for {company_name}: {e}")
+    
+    # Build comprehensive context
+    context = f"Company Website Content:\n{website_content}\n\n"
+    context += "Search Results:\n" + "\n\n".join([
+        f"Source {i+1}:\nTitle: {s.get('title', '')}\nURL: {s.get('url', '')}\nContent: {s.get('content', '')[:500]}"
+        for i, s in enumerate(all_sources[:10])
+    ])
+    
+    # LLM analysis with strict data structure
+    prompt = f"""Analyze {company_name} based ONLY on the provided sources. Cross-reference facts across multiple sources.
+
+Company: {company_name}
+Segment: {segment}
+
+Sources:
+{context}
+
+Provide a JSON response with this EXACT structure:
+{{
+  "summary": "150-word summary",
+  "score_analysis": "Why this company scores well/poorly in the {segment} market",
+  "market_position": "Market position in {segment} segment",
+  "background": "Background as a STRING (founding info, history)",
+  "recent_developments": "Recent developments as a STRING",
+  "products_services": ["Product 1", "Product 2", "Product 3"],
+  "scale_reach": "Scale and reach as a STRING (employee count, geographic presence)",
+  "strategic_notes": "Strategic notes as a STRING",
+  "data_reliability": "high|medium|low"
+}}
+
+IMPORTANT:
+- background, recent_developments, scale_reach, strategic_notes should be PLAIN TEXT STRINGS, not objects
+- products_services should be a simple array of strings
+- Base analysis ONLY on provided sources
+- Return ONLY valid JSON, no markdown"""
+    
+    try:
+        response = await llm_service.generate(prompt, max_tokens=2000)
+        
+        # Clean response
+        response_text = response.strip()
+        response_text = re.sub(r'```json\s*', '', response_text)
+        response_text = re.sub(r'```\s*$', '', response_text)
+        response_text = response_text.strip()
+        
+        profile_data = json.loads(response_text)
+        
+        # Add sources
+        profile_data["sources"] = [
+            {"url": s.get("url", ""), "title": s.get("title", ""), "snippet": s.get("content", "")[:200], "relevance": 0.8}
+            for s in all_sources[:10]
+        ]
+        
+        # Ensure data reliability
+        num_sources = len(all_sources)
+        if num_sources >= 5:
+            profile_data["data_reliability"] = "high"
+        elif num_sources >= 3:
+            profile_data["data_reliability"] = "medium"
+        else:
+            profile_data["data_reliability"] = "low"
+        
+        return profile_data
+        
+    except Exception as e:
+        logger.error(f"LLM profiling failed for {company_name}: {e}")
+        # Return minimal data
         return {
-            "summary": f"{name} is a company relevant to {segment}.",
-            "background": None,
-            "products_services": None,
-            "market_position": None,
-            "score_analysis": None,
-            "sources": discovered_sources,
+            "summary": f"Profile data unavailable for {company_name}",
+            "score_analysis": "Insufficient data",
+            "market_position": "Unknown",
+            "background": "No background data available",
+            "recent_developments": "No recent developments available",
+            "products_services": [],
+            "scale_reach": "Unknown",
+            "strategic_notes": "Insufficient data for analysis",
+            "data_reliability": "low",
+            "sources": []
         }
+
+
+def _safe_text(value: Any) -> str:
+    """Convert arbitrary data to a safe string for text columns."""
+    if value is None:
+        return ""
+    if isinstance(value, (str, int, float)):
+        return str(value)
+    try:
+        return json.dumps(value, ensure_ascii=False)
+    except Exception:
+        return str(value)
+
+
+async def _fetch_website_content(domain: str) -> str:
+    """Fetch and clean website content."""
+    url = domain if domain.startswith("http") else f"https://{domain}"
+    
+    try:
+        async with httpx.AsyncClient(timeout=10.0, follow_redirects=True) as client:
+            response = await client.get(
+                url,
+                headers={"User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36"}
+            )
+            html = response.text
+            
+            # Remove scripts and styles
+            html = re.sub(r'<script[^>]*>.*?</script>', '', html, flags=re.DOTALL | re.IGNORECASE)
+            html = re.sub(r'<style[^>]*>.*?</style>', '', html, flags=re.DOTALL | re.IGNORECASE)
+            html = re.sub(r'<[^>]+>', ' ', html)
+            
+            # Clean text
+            text = unescape(html)
+            text = re.sub(r'\s+', ' ', text)
+            
+            return text[:3000]  # Limit length
+            
+    except Exception as e:
+        logger.warning(f"Failed to fetch {url}: {e}")
+        return ""
+
+
+async def _add_log(db: AsyncSession, session_id: str, message: str):
+    """Add log entry to session."""
+    log = ResearchSessionLog(
+        session_id=session_id,
+        message=message
+    )
+    db.add(log)
+    await db.commit()
+    logger.info(f"[{session_id}] {message}")
+
+
+async def _mark_session_failed(session_id: str, error: str):
+    """Mark session as failed."""
+    async with async_session() as db:
+        result = await db.execute(select(ResearchSession).where(ResearchSession.id == session_id))
+        session = result.scalar_one_or_none()
+        if session:
+            session.status = "FAILED"
+            session.updated_at = datetime.utcnow()
+            await db.commit()
+            await _add_log(db, session_id, f"Session failed: {error[:200]}")

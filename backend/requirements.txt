@@ -5,10 +5,10 @@ pydantic-settings>=2.0
 python-dotenv>=1.0
 SQLAlchemy[asyncio]>=2.0
 alembic>=1.11
-httpx>=0.25
+httpx>=0.25,<0.28
 apscheduler>=3.10
 aiosqlite>=0.20
-
+celery[redis]>=5.3
 # SSE for streaming
 sse-starlette>=1.2
 
