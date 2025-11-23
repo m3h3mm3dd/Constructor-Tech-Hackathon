@@ -62,6 +62,8 @@ celery_app = Celery("backend.app")
 
 # Load configuration from the assembled dictionary. Celery expects configuration via a dict
 celery_app.conf.update(_get_celery_config())
+# Discover tasks under backend.app.workers.* explicitly
+celery_app.autodiscover_tasks(["backend.app.workers"])
 
 
 __all__ = ["celery_app"]

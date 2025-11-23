@@ -7,7 +7,8 @@ are simplistic and can be extended with additional fields or relations.
 
 from datetime import datetime
 
-from sqlalchemy import Boolean, Column, DateTime, ForeignKey, Integer, String, Text, Float
+import uuid
+from sqlalchemy import Boolean, Column, DateTime, ForeignKey, Integer, String, Text, Float, JSON
 from sqlalchemy.orm import relationship
 
 from .base import Base
@@ -179,3 +180,118 @@ class ResearchJob(Base):
 
     # Optionally you could add a relationship to discovered companies
     # via an association table to track which companies belong to which job.
+
+
+# ---------------------------------------------------------------------------
+# New session-centric schema for Scout jobs (sessions + logs + trends)
+# ---------------------------------------------------------------------------
+
+
+class ResearchSession(Base):
+    """Market research session initiated by the user."""
+
+    __tablename__ = "research_sessions"
+
+    id = Column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
+    label = Column(String, nullable=False, index=True)  # what user typed
+    segment = Column(String, nullable=True)
+    status = Column(String, nullable=False, default="PENDING")  # PENDING/RUNNING/COMPLETED/FAILED
+    max_companies = Column(Integer, nullable=True)
+    companies_found = Column(Integer, nullable=False, default=0)
+    charts = Column(JSON, nullable=True)  # precomputed chart datasets
+    scoring_config = Column(JSON, nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+    logs = relationship("ResearchSessionLog", back_populates="session", cascade="all, delete-orphan")
+    companies = relationship("SessionCompany", back_populates="session", cascade="all, delete-orphan")
+    trends = relationship("TrendAnalysis", back_populates="session", cascade="all, delete-orphan")
+
+
+class ResearchSessionLog(Base):
+    """Ordered log lines for a session, driving the terminal console UI."""
+
+    __tablename__ = "research_session_logs"
+
+    id = Column(Integer, primary_key=True, index=True)
+    session_id = Column(String, ForeignKey("research_sessions.id", ondelete="CASCADE"), nullable=False, index=True)
+    ts = Column(DateTime, default=datetime.utcnow, index=True)
+    level = Column(String, default="info")  # info/success/warning/error
+    message = Column(Text, nullable=False)
+    meta = Column(JSON, nullable=True)
+
+    session = relationship("ResearchSession", back_populates="logs")
+
+
+class SessionCompany(Base):
+    """Company discovered as part of a research session."""
+
+    __tablename__ = "session_companies"
+
+    id = Column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
+    session_id = Column(String, ForeignKey("research_sessions.id", ondelete="CASCADE"), nullable=False, index=True)
+    name = Column(String, nullable=False, index=True)
+    domain = Column(String, nullable=True)
+    logo_url = Column(String, nullable=True)
+    score = Column(Integer, nullable=True)
+    status = Column(String, default="PENDING")  # PENDING/COMPLETE/FAILED
+    data_reliability = Column(String, default="medium")
+    last_verified_at = Column(DateTime, nullable=True)
+    founded_year = Column(Integer, nullable=True)
+    employees = Column(Integer, nullable=True)
+    hq_city = Column(String, nullable=True)
+    hq_country = Column(String, nullable=True)
+    primary_tags = Column(JSON, nullable=True)
+    summary = Column(Text, nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+    profile = relationship("CompanyProfile", back_populates="company", uselist=False, cascade="all, delete-orphan")
+    sources = relationship("CompanySource", back_populates="company", cascade="all, delete-orphan")
+    session = relationship("ResearchSession", back_populates="companies")
+
+
+class CompanyProfile(Base):
+    """Detailed profile content for a company (LLM generated)."""
+
+    __tablename__ = "company_profiles"
+
+    company_id = Column(String, ForeignKey("session_companies.id", ondelete="CASCADE"), primary_key=True)
+    summary = Column(Text, nullable=True)
+    score_analysis = Column(Text, nullable=True)
+    market_position = Column(Text, nullable=True)
+    background = Column(Text, nullable=True)
+    recent_developments = Column(Text, nullable=True)
+    products_services = Column(Text, nullable=True)
+    scale_reach = Column(Text, nullable=True)
+    strategic_notes = Column(Text, nullable=True)
+
+    company = relationship("SessionCompany", back_populates="profile")
+
+
+class CompanySource(Base):
+    """Sources underpinning a company profile."""
+
+    __tablename__ = "company_sources"
+
+    id = Column(Integer, primary_key=True, index=True)
+    company_id = Column(String, ForeignKey("session_companies.id", ondelete="CASCADE"), nullable=False, index=True)
+    url = Column(String, nullable=False)
+    label = Column(String, nullable=True)
+    source_type = Column(String, nullable=True)  # news, official_site, report
+
+    company = relationship("SessionCompany", back_populates="sources")
+
+
+class TrendAnalysis(Base):
+    """Stored trend analysis for a session."""
+
+    __tablename__ = "trend_analyses"
+
+    id = Column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
+    session_id = Column(String, ForeignKey("research_sessions.id", ondelete="CASCADE"), nullable=False, index=True)
+    overview = Column(Text, nullable=True)
+    bars = Column(JSON, nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+    session = relationship("ResearchSession", back_populates="trends")

@@ -26,17 +26,21 @@ class Settings(BaseSettings):
     environment.
     """
 
-    # OpenRouter / OpenAI compatible API key used by the OpenAI SDK. This key
-    # is mandatory for calling the chat completion API. Do not hardcode
-    # secrets in source code; instead populate this in your ``.env`` file or
-    # environment.
-    OPENAI_API_KEY: str
+    # OpenAI-compatible API key. Use a free provider by default (Groq).
+    # GROQ offers a free Llama 3.1 API key at https://console.groq.com/keys.
+    # You can also supply OPENAI_API_KEY for OpenRouter or OpenAI if desired.
+    LLM_API_KEY: str | None = None
+    OPENAI_API_KEY: str | None = None
 
     # Name of the language model to use when generating content via the
-    # ``openai`` client. Defaults to a small and inexpensive model but can be
-    # overridden in the ``.env`` file. For example, to use GPT‑4 set
-    # ``LLM_MODEL=openai/gpt-4-turbo".
-    LLM_MODEL: str = "openai/gpt-4.1-mini"
+    # ``openai`` client. Defaults to a free Groq model.
+    # Override to other OpenAI-compatible models if you have credits.
+    LLM_MODEL: str = "llama-3.1-8b-instant"
+
+    # Base URL for the OpenAI-compatible API. Groq uses:
+    # https://api.groq.com/openai/v1
+    # OpenRouter uses: https://openrouter.ai/api/v1
+    LLM_API_BASE: str = "https://api.groq.com/openai/v1"
 
     # API key for the external web search provider (SerpAPI, Tavily, etc.).
     # The discovery and profiling pipelines call a search API to find

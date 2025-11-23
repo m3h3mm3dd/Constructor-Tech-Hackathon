@@ -14,7 +14,7 @@ import csv
 import io
 from typing import List, Optional
 
-from fastapi import APIRouter, Depends, HTTPException, Response, status
+from fastapi import APIRouter, Depends, HTTPException, Query, Response, status
 
 from ...db.models import Company, ResearchJob
 from ...api.deps import get_db
@@ -41,64 +41,40 @@ from sqlalchemy.ext.asyncio import AsyncSession
 router = APIRouter(prefix="/research", tags=["research"])
 
 
-@router.post("/start", response_model=ResearchJobResponse, status_code=status.HTTP_201_CREATED)
+@router.post("/start", response_model=ResearchJobResponse, status_code=status.HTTP_201_CREATED, deprecated=True)
 async def start_research_job(
     request: ResearchStartRequest, db: AsyncSession = Depends(get_db)
 ) -> ResearchJobResponse:
-    """Start a new competitor research job.
-
-    This endpoint triggers discovery and profiling pipelines. It blocks
-    until all companies have been profiled; for hackathon purposes
-    asynchronous background execution is not required.
-    """
+    """Legacy start endpoint (replaced by sessions)."""
     return await start_research(request.segment, request.max_companies, db)
 
-
-@router.get("/{job_id}", response_model=ResearchJobResponse)
-async def get_research_job(job_id: int, db: AsyncSession = Depends(get_db)) -> ResearchJobResponse:
-    """Retrieve the status of a research job and the companies it discovered."""
-    result = await db.execute(select(ResearchJob).where(ResearchJob.id == job_id))
-    job = result.scalars().first()
-    if not job:
-        raise HTTPException(status_code=404, detail="Job not found")
-    # Gather companies related to this segment
-    stmt = select(Company).where(Company.segment == job.segment)
-    result = await db.execute(stmt)
-    companies = result.scalars().all()
-    company_statuses = []
-    for c in companies:
-        status_str = "profiled" if c.last_updated else "pending"
-        has_profile = bool(c.description)
-        company_statuses.append(
-            {
-                "id": c.id,
-                "name": c.name,
-                "status": status_str,
-                "last_updated": c.last_updated,
-                "has_profile": has_profile,
-            }
-        )
-    return ResearchJobResponse(
-        id=job.id,
-        segment=job.segment,
-        status=job.status,
-        error_message=job.error_message,
-        created_at=job.created_at,
-        finished_at=job.finished_at,
-        companies=company_statuses,
-    )
 
 @router.get("/companies", response_model=List[CompanySummary])
 async def list_companies(
     db: AsyncSession = Depends(get_db),
+    segment: Optional[str] = Query(None, description="Filter by market segment"),
+    category: Optional[str] = Query(None, description="Filter by category"),
+    region: Optional[str] = Query(None, description="Filter by region"),
+    has_ai_features: Optional[bool] = Query(None, description="Filter by AI features presence"),
+    search: Optional[str] = Query(None, description="Search by company name"),
 ) -> List[CompanySummary]:
     """
-    List all companies.
-
-    Frontend doesn't send any filters yet, so this endpoint accepts an
-    empty request and just returns all rows.
+    List all companies with optional filters.
     """
     stmt = select(Company)
+    
+    # Apply filters
+    if segment:
+        stmt = stmt.where(Company.segment == segment)
+    if category:
+        stmt = stmt.where(Company.category == category)
+    if region:
+        stmt = stmt.where(Company.region == region)
+    if has_ai_features is not None:
+        stmt = stmt.where(Company.has_ai_features == has_ai_features)
+    if search:
+        stmt = stmt.where(Company.name.ilike(f"%{search}%"))
+    
     result = await db.execute(stmt)
     companies = result.scalars().all()
     return [
@@ -107,6 +83,7 @@ async def list_companies(
             name=c.name,
             category=c.category,
             region=c.region,
+            segment=c.segment,
             size_bucket=c.size_bucket,
             description=c.description,
             last_updated=c.last_updated,
@@ -208,7 +185,10 @@ async def stats_overview(db: AsyncSession = Depends(get_db)) -> StatsOverviewRes
 
 
 @router.get("/export")
-async def export_companies(segment: Optional[str] = None, db: AsyncSession = Depends(get_db)) -> Response:
+async def export_companies(
+    db: AsyncSession = Depends(get_db),
+    segment: Optional[str] = Query(None, description="Filter export by segment"),
+) -> Response:
     """Export all companies (optionally filtered by segment) as a CSV file."""
     stmt = select(Company)
     if segment:
@@ -268,3 +248,39 @@ async def export_companies(segment: Optional[str] = None, db: AsyncSession = Dep
         "Content-Disposition": "attachment; filename=companies.csv",
     }
     return Response(content=csv_bytes, headers=headers)
+
+
+# IMPORTANT: This route MUST come last to avoid conflicts with paths like /companies, /stats, etc.
+@router.get("/{job_id}", response_model=ResearchJobResponse)
+async def get_research_job(job_id: int, db: AsyncSession = Depends(get_db)) -> ResearchJobResponse:
+    """Retrieve the status of a research job and the companies it discovered."""
+    result = await db.execute(select(ResearchJob).where(ResearchJob.id == job_id))
+    job = result.scalars().first()
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+    # Gather companies related to this segment
+    stmt = select(Company).where(Company.segment == job.segment)
+    result = await db.execute(stmt)
+    companies = result.scalars().all()
+    company_statuses = []
+    for c in companies:
+        status_str = "profiled" if c.last_updated else "pending"
+        has_profile = bool(c.description)
+        company_statuses.append(
+            {
+                "id": c.id,
+                "name": c.name,
+                "status": status_str,
+                "last_updated": c.last_updated,
+                "has_profile": has_profile,
+            }
+        )
+    return ResearchJobResponse(
+        job_id=job.id,
+        segment=job.segment,
+        status=job.status,
+        error_message=job.error_message,
+        created_at=job.created_at,
+        finished_at=job.finished_at,
+        companies=company_statuses,
+    )

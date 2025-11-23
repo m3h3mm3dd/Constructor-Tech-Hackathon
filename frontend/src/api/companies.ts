@@ -55,9 +55,10 @@ export async function fetchCompany(id: number): Promise<{ company: CompanyProfil
 export async function compareCompanies(
   request: CompareRequest,
 ): Promise<CompareResponse> {
+  // Transform frontend camelCase to backend snake_case
   const res = await apiClient.post<CompareResponse>(
     '/api/v1/research/companies/compare',
-    { company_ids: request.companyIds.map((id) => Number(id)) },
+    { company_ids: request.companyIds },
   );
   return res.data;
 }

@@ -3,8 +3,8 @@ celery[redis]>=5.3
 redis>=5.0
 
 # RAG features
-langchain>=0.1
-chromadb>=0.4
+#langchain>=0.1
+#chromadb>=0.4
 # faiss-cpu is optional & often slow to install, esp. on Mac
 #faiss-cpu>=1.7
 

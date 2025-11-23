@@ -76,82 +76,128 @@ async def start_research(
     await db.refresh(job)
     logger.info("Started research job %s for segment '%s'", job.id, segment)
 
-    # Step 1: use LLM to discover candidate companies
-    try:
-        discovered = await _discover_companies_via_llm(segment, max_companies)
-    except Exception as exc:
-        job.status = "failed"
-        job.error_message = f"Discovery failed: {exc}"[:512]
-        job.finished_at = datetime.utcnow()
-        await db.commit()
-        logger.exception("Discovery failed for job %s: %s", job.id, exc)
-        raise
-
     company_statuses: List[ResearchJobCompanyStatus] = []
 
-    # Upsert each discovered company and profile it
-    for item in discovered:
-        name = item.get("name")
-        website = item.get("website")
-        category = item.get("category")
-        region = item.get("region")
-        size_bucket = item.get("size_bucket")
-        # Upsert into DB
-        result = await db.execute(select(Company).where(Company.name == name))
-        company: Optional[Company] = result.scalars().first()
-        if company:
-            # Update minimal fields if previously unknown
-            if segment and not company.segment:
-                company.segment = segment
-            if category and not company.category:
-                company.category = category
-            if region and not company.region:
-                company.region = region
-            if size_bucket and not company.size_bucket:
-                company.size_bucket = size_bucket
-            if website and not company.website:
-                company.website = website
-        else:
-            company = Company(
-                name=name,
-                website=website,
-                segment=segment,
-                category=category,
-                region=region,
-                size_bucket=size_bucket,
-                first_discovered=datetime.utcnow(),
+    try:
+        # Step 1: use LLM to discover candidate companies
+        discovered = await _discover_companies_via_llm(segment, max_companies)
+        
+        if not discovered:
+            logger.warning("No companies discovered for segment: %s", segment)
+            job.status = "done"
+            job.error_message = "No companies found for this segment"
+            job.finished_at = datetime.utcnow()
+            await db.commit()
+            return ResearchJobResponse(
+                job_id=job.id,
+                segment=job.segment,
+                status=job.status,
+                error_message=job.error_message,
+                created_at=job.created_at,
+                finished_at=job.finished_at,
+                companies=[],
             )
-            db.add(company)
-            await db.flush()  # assign id
+
+        # Step 2: Upsert each discovered company and profile it
+        for item in discovered:
+            name = item.get("name")
+            if not name:
+                continue
+                
+            website = item.get("website")
+            category = item.get("category")
+            region = item.get("region")
+            size_bucket = item.get("size_bucket")
+            
+            # Upsert into DB
+            result = await db.execute(select(Company).where(Company.name == name))
+            company: Optional[Company] = result.scalars().first()
+            
+            if company:
+                # Update existing company
+                logger.info("Updating existing company: %s", name)
+                if segment and not company.segment:
+                    company.segment = segment
+                if category and not company.category:
+                    company.category = category
+                if region and not company.region:
+                    company.region = region
+                if size_bucket and not company.size_bucket:
+                    company.size_bucket = size_bucket
+                if website and not company.website:
+                    company.website = website
+            else:
+                # Create new company
+                logger.info("Creating new company: %s", name)
+                company = Company(
+                    name=name,
+                    website=website,
+                    segment=segment,
+                    category=category,
+                    region=region,
+                    size_bucket=size_bucket,
+                    first_discovered=datetime.utcnow(),
+                )
+                db.add(company)
+            
+            # Commit after each company creation/update
+            await db.commit()
+            await db.refresh(company)
+            
+            # Initialize status
+            status = ResearchJobCompanyStatus(
+                id=company.id,
+                name=company.name,
+                status="pending",
+                last_updated=company.last_updated,
+                has_profile=False,
+            )
+            
+            # Profile the company
+            try:
+                logger.info("Profiling company: %s", company.name)
+                await profile_company(company, db)
+                await db.refresh(company)  # Refresh to get updated fields
+                status.status = "profiled"
+                status.last_updated = company.last_updated
+                status.has_profile = bool(company.description)
+                logger.info("Successfully profiled: %s", company.name)
+            except Exception as exc:
+                logger.exception("Profiling failed for %s: %s", company.name, exc)
+                status.status = "failed"
+                status.has_profile = False
+                # Continue to next company even if this one fails
+            
+            company_statuses.append(status)
+            
+            # Commit after profiling each company
+            await db.commit()
+
+        # Mark job as done
+        job.status = "done"
+        job.finished_at = datetime.utcnow()
         await db.commit()
-        await db.refresh(company)
+        logger.info("Completed research job %s with %d companies", job.id, len(company_statuses))
 
-        # Profile the company
-        status = ResearchJobCompanyStatus(
-            id=company.id,
-            name=company.name,
-            status="pending",
-            last_updated=company.last_updated,
-            has_profile=False,
+    except Exception as exc:
+        logger.exception("Research job %s failed: %s", job.id, exc)
+        job.status = "failed"
+        job.error_message = str(exc)[:512]
+        job.finished_at = datetime.utcnow()
+        await db.commit()
+        
+        return ResearchJobResponse(
+            job_id=job.id,
+            segment=job.segment,
+            status=job.status,
+            error_message=job.error_message,
+            created_at=job.created_at,
+            finished_at=job.finished_at,
+            companies=company_statuses,
         )
-        try:
-            await profile_company(company, db)
-            status.status = "profiled"
-            status.last_updated = company.last_updated
-            status.has_profile = True
-        except Exception as exc:
-            logger.exception("Profiling failed for %s: %s", company.name, exc)
-            # leave status as pending; continue to next company
-        company_statuses.append(status)
-
-    # Mark job as done
-    job.status = "done"
-    job.finished_at = datetime.utcnow()
-    await db.commit()
-    logger.info("Completed research job %s", job.id)
 
     return ResearchJobResponse(
-        id=job.id,
+        job_id=job.id,
         segment=job.segment,
         status=job.status,
         error_message=job.error_message,
@@ -179,19 +225,35 @@ async def _discover_companies_via_llm(segment: str, max_companies: int) -> List[
     system_prompt = (
         "You are an assistant that helps with market research in the education and LMS sector. "
         "Given a description of a market segment, propose up to {max_n} relevant companies. "
-        "Return a JSON object with a top level key 'companies' whose value is a list of objects. "
+        "Return ONLY a JSON object with a top level key 'companies' whose value is a list of objects. "
         "Each company object must contain: 'name' (string), and optionally 'website', 'category', 'region', 'size_bucket'. "
-        "Do not include any commentary outside of the JSON."
+        "Do not include any commentary, markdown formatting, or anything outside of the JSON."
     ).format(max_n=max_companies)
+    
     user_prompt = f"Segment: {segment}. Provide up to {max_companies} companies."
+    
     messages = [
         {"role": "system", "content": system_prompt},
         {"role": "user", "content": user_prompt},
     ]
-    raw = await generate(messages, model=settings.LLM_MODEL)
+    
     try:
+        raw = await generate(messages, model=settings.LLM_MODEL, max_tokens=2000)
+        
+        # Clean up the response - remove markdown code blocks if present
+        raw = raw.strip()
+        if raw.startswith("```json"):
+            raw = raw[7:]
+        if raw.startswith("```"):
+            raw = raw[3:]
+        if raw.endswith("```"):
+            raw = raw[:-3]
+        raw = raw.strip()
+        
+        logger.info("LLM discovery response: %s", raw[:200])
+        
         data = json.loads(raw)
-        return [
+        companies = [
             {
                 "name": c.get("name"),
                 "website": c.get("website"),
@@ -202,8 +264,15 @@ async def _discover_companies_via_llm(segment: str, max_companies: int) -> List[
             for c in data.get("companies", [])[:max_companies]
             if c.get("name")
         ]
+        
+        logger.info("Discovered %d companies", len(companies))
+        return companies
+        
+    except json.JSONDecodeError as exc:
+        logger.error("Failed to parse discovery JSON: %s. Raw response: %s", exc, raw[:500])
+        return []
     except Exception as exc:
-        logger.error("Failed to parse discovery JSON: %s", exc)
+        logger.exception("Error during company discovery: %s", exc)
         return []
 
 
@@ -223,54 +292,54 @@ async def profile_company(company: Company, db: AsyncSession) -> None:
     Returns:
         None. The company object is updated and committed to the database.
     """
+    logger.info("Starting profiling for company: %s", company.name)
+    
     # Build search queries
     queries = [
         f"{company.name} education platform",
-        f"{company.name} pricing",
-        f"{company.name} LMS",
-        f"{company.name} review",
+        f"{company.name} LMS features",
     ]
+    
     # Gather documents
     documents: List[Tuple[str, str, str]] = []  # (url, title, snippet)
     try:
-        for q in queries:
+        for q in queries[:2]:  # Limit to 2 queries to save time
             try:
-                results = await search_web(q, num_results=3)
+                results = await search_web(q, num_results=2)  # Reduced from 3
+                for item in results:
+                    url = item.get("url")
+                    title = item.get("title")
+                    snippet = item.get("snippet")
+                    if url and not any(d[0] == url for d in documents):
+                        documents.append((url, title, snippet))
             except SearchError as e:
                 logger.warning("Search disabled or failed: %s", e)
                 break
-            for item in results:
-                url = item.get("url")
-                title = item.get("title")
-                snippet = item.get("snippet")
-                if url and not any(d[0] == url for d in documents):
-                    documents.append((url, title, snippet))
     except Exception as exc:
         logger.exception("Error during search for %s: %s", company.name, exc)
 
     # Fetch and clean text for each document
     context_parts: List[str] = []
-    for idx, (url, title, snippet) in enumerate(documents[:5]):
+    for idx, (url, title, snippet) in enumerate(documents[:3]):  # Limit to 3 docs
         try:
-            async with httpx.AsyncClient(timeout=15) as client:
+            async with httpx.AsyncClient(timeout=10) as client:  # Reduced timeout
                 resp = await client.get(url, headers={"User-Agent": "CompetitorResearchBot/1.0"})
                 if resp.status_code == 200 and "text" in resp.headers.get("content-type", ""):
-                    # Simple HTML to text: strip tags and collapse whitespace
                     import re
                     from html import unescape
-
                     html = resp.text
                     html = re.sub(r"<script[^>]*>.*?</script>", " ", html, flags=re.DOTALL | re.IGNORECASE)
                     html = re.sub(r"<style[^>]*>.*?</style>", " ", html, flags=re.DOTALL | re.IGNORECASE)
                     text = re.sub(r"<[^>]+>", " ", html)
                     text = unescape(text)
                     text = re.sub(r"\s+", " ", text)
-                    plain = text.strip()[:3000]
+                    plain = text.strip()[:1500]  # Reduced from 3000
                 else:
                     plain = snippet or ""
         except Exception as exc:
             logger.debug("Failed to fetch %s: %s", url, exc)
             plain = snippet or ""
+        
         # Persist source document
         doc = SourceDocument(
             company_id=company.id,
@@ -284,36 +353,68 @@ async def profile_company(company: Company, db: AsyncSession) -> None:
         )
         db.add(doc)
         context_parts.append(plain)
+    
     await db.commit()
 
     # Compose prompt for LLM
-    context_text = "\n\n".join(context_parts)[:8000]  # limit context length
+    context_text = "\n\n".join(context_parts)[:4000]  # Reduced from 8000
+    
     system_prompt = (
         "You are an expert market analyst for EdTech and LMS companies. "
-        "Using the provided context (which may include website copy, reviews, articles, etc.), "
-        "produce a JSON object describing the company with the following keys: "
-        "name (string), website (string or null), segment (string or null), category (string or null), region (string or null), "
-        "size_bucket (string or null), description (string or null), background (string or null), products (list of strings or null), "
-        "target_segments (list of strings or null), pricing_model (list of strings or null), market_position (string or null), "
-        "strengths (list of strings), risks (list of strings), has_ai_features (boolean), compliance_tags (list of strings or null). "
-        "Always include all keys. If information is unavailable, use null or an empty list. Do not wrap the JSON in markdown."
+        "Using the provided context, produce a JSON object describing the company. "
+        "Required keys: name, website, segment, category, region, size_bucket, description, "
+        "background, products, target_segments, pricing_model, market_position, strengths, "
+        "risks, has_ai_features, compliance_tags. "
+        "For list fields (products, target_segments, pricing_model, strengths, risks, compliance_tags), "
+        "provide arrays of strings. "
+        "Always include all keys. If information is unavailable, use null or an empty array. "
+        "has_ai_features should be a boolean. "
+        "Do not wrap the JSON in markdown or code blocks."
     )
+    
     user_prompt = (
         f"Context:\n{context_text}\n\n"
         f"Company name: {company.name}. Website: {company.website or 'unknown'}. "
         "Return the JSON profile."
     )
+    
     messages = [
         {"role": "system", "content": system_prompt},
         {"role": "user", "content": user_prompt},
     ]
-    raw = await generate(messages, model=settings.LLM_MODEL)
+    
     try:
+        raw = await generate(messages, model=settings.LLM_MODEL, max_tokens=2000)
+        
+        # Clean up response
+        raw = raw.strip()
+        if raw.startswith("```json"):
+            raw = raw[7:]
+        if raw.startswith("```"):
+            raw = raw[3:]
+        if raw.endswith("```"):
+            raw = raw[:-3]
+        raw = raw.strip()
+        
+        logger.info("Profile response for %s: %s", company.name, raw[:200])
+        
         profile = json.loads(raw)
-    except Exception as exc:
-        logger.error("Failed to parse profile JSON for %s: %s", company.name, exc)
+    except json.JSONDecodeError as exc:
+        logger.error("Failed to parse profile JSON for %s: %s. Raw: %s", company.name, exc, raw[:500])
         profile = {}
+    except Exception as exc:
+        logger.exception("Error generating profile for %s: %s", company.name, exc)
+        profile = {}
+    
     # Update company fields
+    def list_to_json(value):
+        """Convert list to JSON string, or return original if not a list."""
+        if isinstance(value, list):
+            return json.dumps(value)
+        elif isinstance(value, str):
+            return value
+        return None
+    
     company.website = profile.get("website") or company.website
     company.segment = profile.get("segment") or company.segment
     company.category = profile.get("category") or company.category
@@ -321,26 +422,19 @@ async def profile_company(company: Company, db: AsyncSession) -> None:
     company.size_bucket = profile.get("size_bucket") or company.size_bucket
     company.description = profile.get("description") or company.description
     company.background = profile.get("background") or company.background
-    # Convert lists to JSON strings for storage
-    def list_or_str(value: Optional[List[str] | str]) -> Optional[str]:
-        if isinstance(value, list):
-            try:
-                return json.dumps(value)
-            except Exception:
-                return ", ".join(value)
-        return value
-
-    company.products = list_or_str(profile.get("products")) or company.products
-    company.target_segments = list_or_str(profile.get("target_segments")) or company.target_segments
-    company.pricing_model = list_or_str(profile.get("pricing_model")) or company.pricing_model
+    company.products = list_to_json(profile.get("products")) or company.products
+    company.target_segments = list_to_json(profile.get("target_segments")) or company.target_segments
+    company.pricing_model = list_to_json(profile.get("pricing_model")) or company.pricing_model
     company.market_position = profile.get("market_position") or company.market_position
-    company.strengths = list_or_str(profile.get("strengths")) or company.strengths
-    company.risks = list_or_str(profile.get("risks")) or company.risks
+    company.strengths = list_to_json(profile.get("strengths")) or company.strengths
+    company.risks = list_to_json(profile.get("risks")) or company.risks
     company.has_ai_features = bool(profile.get("has_ai_features", company.has_ai_features))
-    company.compliance_tags = list_or_str(profile.get("compliance_tags")) or company.compliance_tags
+    company.compliance_tags = list_to_json(profile.get("compliance_tags")) or company.compliance_tags
     company.last_updated = datetime.utcnow()
+    
     await db.commit()
-    await db.refresh(company)
+    logger.info("Successfully updated profile for: %s", company.name)
+
 
 
 async def refresh_company(company_id: int, db: AsyncSession) -> None:

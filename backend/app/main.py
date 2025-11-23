@@ -20,6 +20,7 @@ from .api.v1 import (
     agent_routes,
     admin_routes,
     research_routes,
+    session_routes,
 )
 
 
@@ -53,6 +54,7 @@ def create_app() -> FastAPI:
     app.include_router(admin_routes.router, prefix="/api/v1/admin", tags=["admin"])
     # Include the competitor research endpoints under /api/v1/research
     app.include_router(research_routes.router, prefix="/api/v1", tags=["research"])
+    app.include_router(session_routes.router, prefix="/api/v1", tags=["research-sessions"])
 
     # Health check endpoint. Useful for Kubernetes probes or uptime monitoring.
     @app.get("/health")
