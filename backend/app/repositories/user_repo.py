@@ -21,7 +21,11 @@ async def get_user_by_email(db: AsyncSession, email: str) -> Optional[User]:
 
 
 async def create_user(db: AsyncSession, email: str, hashed_password: str) -> User:
-    """Create and persist a new user."""
+    """Create and persist a new user, or return an existing one."""
+    existing = await get_user_by_email(db, email)
+    if existing:
+        return existing
+
     user = User(email=email, hashed_password=hashed_password)
     db.add(user)
     await db.commit()
